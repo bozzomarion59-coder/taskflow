@@ -4,6 +4,9 @@ on:
   pull_request:          # toutes les PR, sans filtre
   push:
     branches: [main]     # et chaque push sur main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
 
 permissions:
   contents: read         # la CI lit le code, elle n'écrit rien
@@ -11,6 +14,10 @@ permissions:
 env:
   COVERAGE_MIN: 75        # seuil sur les lignes (%), défini une seule fois ici
   
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}   # un groupe par PR, un par branche
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}    # on annule sur une PR, jamais sur main
+
 jobs:
   api:
     name: api
