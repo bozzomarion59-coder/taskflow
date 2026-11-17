@@ -1,0 +1,75 @@
+# TaskFlow : traduction GitLab CI de .github/workflows/ci.yml
+stages:
+  - verify
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible          # = concurrency / cancel-in-progress
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"   # = pull_request
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH        # = push sur main
+
+default:
+  interruptible: true
+
+variables:
+  npm_config_cache: "$CI_PROJECT_DIR/.npm"  # cache npm dans le projet pour pouvoir le mettre en cache
+
+api:
+  stage: verify
+  image: node:$NODE_VERSION-alpine
+  timeout: 10 minutes
+  parallel:
+    matrix:
+      - NODE_VERSION: ["20", "22"]          # = strategy.matrix
+  cache:
+    key:
+      files: [api/package-lock.json]        # clé = contenu du lockfile
+    paths: [.npm/]
+  script:
+    - cd api
+    - npm ci
+    - npm run lint
+    - npm run format:check
+    - npm run test:coverage
+
+api-integration:
+  stage: verify
+  image: node:20-alpine
+  timeout: 10 minutes
+  services:
+    - name: postgres:16-alpine
+      alias: postgres                       # le job tourne dans un conteneur : on joint la base par cet alias
+  variables:
+    POSTGRES_USER: taskflow
+    POSTGRES_PASSWORD: taskflow
+    POSTGRES_DB: taskflow
+    DATABASE_URL: postgres://taskflow:taskflow@postgres:5432/taskflow   # PAS localhost
+  cache:
+    key:
+      files: [api/package-lock.json]
+    paths: [.npm/]
+  script:
+    - cd api
+    - npm ci
+    - npm run test:int
+
+front:
+  stage: verify
+  image: node:20-alpine
+  timeout: 10 minutes
+  cache:
+    key:
+      files: [front/package-lock.json]
+    paths: [.npm/]
+  script:
+    - cd front
+    - npm ci
+    - npm run lint
+    - npm run format:check
+    - npm run test:coverage
+    - npm run build
+  artifacts:
+    name: front-dist
+    paths: [front/dist/]
+    expire_in: 7 days
