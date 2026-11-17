@@ -1,0 +1,85 @@
+// TaskFlow : traduction Jenkins (pipeline déclaratif) de .github/workflows/ci.yml
+pipeline {
+  agent none                                   // pas d'agent global : chaque stage choisit le sien
+  options {
+    timeout(time: 20, unit: 'MINUTES')         // = timeout-minutes
+    disableConcurrentBuilds(abortPrevious: true)           // = concurrency
+    buildDiscarder(logRotator(artifactDaysToKeepStr: '7')) // = retention-days: 7
+  }
+  environment { npm_config_cache = '/tmp/.npm' }   // HOME non inscriptible dans le conteneur
+
+  stages {
+    // ---------- api : matrice Node 20 / 22 (= strategy.matrix) ----------
+    stage('api') {
+      matrix {
+        axes {
+          axis { name 'NODE'; values '20', '22' }
+        }
+        agent { docker { image "node:${NODE}-alpine" } }
+        stages {
+          stage('lint + tests unitaires') {
+            steps {
+              dir('api') {
+                sh 'npm ci'
+                sh 'npm run lint'
+                sh 'npm run format:check'
+                sh 'npm run test:coverage'
+              }
+            }
+          }
+        }
+      }
+    }
+
+    stage('integration et front') {
+      parallel {
+        // ---------- api-integration : Postgres lancé par le pipeline ----------
+        stage('api-integration') {
+          agent any                              // il faut le CLI docker pour lancer Postgres
+          options { timeout(time: 10, unit: 'MINUTES') }
+          steps {
+            script {
+              def net = "ci-${env.BUILD_TAG}".toLowerCase().replaceAll('[^a-z0-9_.-]', '-')
+              sh "docker network create ${net}"
+              try {
+                docker.image('postgres:16-alpine').withRun(
+                    "--network ${net} --network-alias postgres " +
+                    "-e POSTGRES_USER=taskflow -e POSTGRES_PASSWORD=taskflow -e POSTGRES_DB=taskflow") { pg ->
+                  retry(10) { sleep 1; sh "docker exec ${pg.id} pg_isready -U taskflow -d taskflow" }   // attendre la base
+                  docker.image('node:20-alpine').inside("--network ${net}") {
+                    withEnv(['DATABASE_URL=postgres://taskflow:taskflow@postgres:5432/taskflow']) {   // PAS localhost
+                      dir('api') {
+                        sh 'npm ci'
+                        sh 'npm run test:int'
+                      }
+                    }
+                  }
+                }
+              } finally {
+                sh "docker network rm ${net} || true"     // ménage
+              }
+            }
+          }
+        }
+
+        // ---------- front : lint, tests, build, artefact ----------
+        stage('front') {
+          agent { docker { image 'node:20-alpine' } }
+          options { timeout(time: 10, unit: 'MINUTES') }
+          steps {
+            dir('front') {
+              sh 'npm ci'
+              sh 'npm run lint'
+              sh 'npm run format:check'
+              sh 'npm run test:coverage'
+              sh 'npm run build'
+            }
+          }
+          post {
+            success { archiveArtifacts artifacts: 'front/dist/**', fingerprint: true }
+          }
+        }
+      }
+    }
+  }
+}
