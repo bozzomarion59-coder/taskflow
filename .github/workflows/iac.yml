@@ -41,7 +41,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TOFU_VERSION: "1.13.5"
+  TOFU_VERSION: "1.13.9"
   TF_IN_AUTOMATION: "1" # messages adaptés à un pipeline (pas de « run tofu apply now »)
   TF_INPUT: "0" # jamais de question interactive : une variable manquante = erreur
 
