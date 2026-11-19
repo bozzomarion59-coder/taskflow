@@ -96,6 +96,7 @@ resource "docker_container" "api" {
 }
 
 resource "docker_container" "front" {
+  cpu_shares = 512
   name       = "${local.prefix}-front"
   image      = docker_image.front.image_id
   restart    = "unless-stopped"
