@@ -1,0 +1,39 @@
+# Test promtool : TaskFlowApiDown est "pending" à 30 s d'échec, "firing" après 1 min 30.
+# La sonde réussit jusqu'à 60 s, puis échoue à partir de 75 s (série à 15 s d'intervalle).
+rule_files:
+  - /etc/prometheus/rules/taskflow.yml
+
+evaluation_interval: 15s
+
+tests:
+  - interval: 15s
+    input_series:
+      - series: 'probe_success{job="blackbox-health", env="prod", instance="http://front/health"}'
+        values: '1x4 0x20'
+
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="TaskFlowApiDown"}'
+        eval_time: 105s # 30 s d'échec
+        exp_samples:
+          - labels: 'ALERTS{alertname="TaskFlowApiDown", alertstate="pending", env="prod", instance="http://front/health", job="blackbox-health", severity="critical"}'
+            value: 1
+
+    alert_rule_test:
+      - eval_time: 45s # la sonde réussit encore
+        alertname: TaskFlowApiDown
+        exp_alerts: []
+      - eval_time: 105s # pending : pas encore firing
+        alertname: TaskFlowApiDown
+        exp_alerts: []
+      - eval_time: 165s # 1 min 30 d'échec : firing
+        alertname: TaskFlowApiDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              env: prod
+              instance: "http://front/health"
+              job: blackbox-health
+            exp_annotations:
+              summary: "L'API TaskFlow ne répond plus (prod)"
+              description: "La sonde de http://front/health échoue depuis plus d'une minute (/health ne renvoie pas status ok)."
+              runbook_url: "https://github.com/bozzomarion59-coder/taskflow/blob/main/docs/INCIDENTS.md"
