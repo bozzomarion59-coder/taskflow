@@ -30,3 +30,11 @@ backups/
 *.pem
 *.key
 *.crt
+
+# OpenTofu
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+terraform.tfvars

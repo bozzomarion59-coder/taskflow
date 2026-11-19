@@ -186,44 +186,86 @@ jobs:
       url: http://localhost:${{ vars.FRONT_PORT || '8081' }}
     permissions:
       contents: read
-      packages: read
+      packages: read # le provider Docker tire les images privées de ghcr.io
     # Un seul déploiement à la fois par environnement, jamais interrompu.
     concurrency:
       group: deploy-staging
       cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: infra
     env:
       TAG: ${{ needs.prepare.outputs.tag }}
       FRONT_PORT: ${{ vars.FRONT_PORT || '8081' }}
-      REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TF_IN_AUTOMATION: "1"
+      TF_INPUT: "0"
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/../.tofu-plugin-cache
+      # Variables OpenTofu lues dans l'environnement (TF_VAR_<nom>)
+      TF_VAR_front_port: ${{ vars.FRONT_PORT || '8081' }}
+      TF_VAR_ghcr_username: ${{ github.actor }}
+      TF_VAR_ghcr_token: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Vérifier le runner
+        working-directory: .
+        run: |
+          if [ -z "${STAGING_DIR:-}" ] || [ ! -d "$STAGING_DIR" ]; then
+            echo "::error::STAGING_DIR absent : le runner du lab est-il bien configuré ?"; exit 1
+          fi
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          tofu version
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # STAGING_DIR est une variable du processus du runner : lisible dans run:,
-      # pas dans ${{ env.* }}.
-      - name: Copier les fichiers de déploiement
+      - name: tofu init (state dans STAGING_DIR)
+        run: tofu init -lockfile=readonly -backend-config="path=$STAGING_DIR/terraform.tfstate"
+
+      - name: Variables OpenTofu
+        run: ./ci-env.sh "$TAG"
+
+      # Une seule fois : le staging Compose du Jour 3 occupe les mêmes noms et le
+      # port 8081. On supprime ses conteneurs et son réseau (PAS son volume), puis
+      # on fait entrer le volume existant dans le state (tofu import) au lieu de le
+      # recréer. Sans effet aux déploiements suivants.
+      - name: Migrer depuis le staging Compose (si présent)
         run: |
-          [ -f "$STAGING_DIR/.env" ] || { echo "::error::STAGING_DIR absent ou sans .env"; exit 1; }
-          cp compose.staging.yaml deploy/deploy.sh deploy/smoke-test.sh "$STAGING_DIR/"
+          ids="$(docker ps -aq --filter label=com.docker.compose.project=taskflow-staging)"
+          if [ -n "$ids" ]; then
+            echo "Staging Compose détecté : suppression des conteneurs et du réseau (le volume est conservé)"
+            # shellcheck disable=SC2086  # une liste d'identifiants, découpage voulu
+            docker rm -f $ids
+            docker network rm taskflow-staging
+          fi
+          if ! tofu state list 2>/dev/null | grep -qx 'docker_volume.pgdata' \
+             && docker volume inspect taskflow-staging-pgdata >/dev/null 2>&1; then
+            echo "Volume existant : import dans le state"
+            tofu import -lock-timeout=120s docker_volume.pgdata taskflow-staging-pgdata
+          fi
 
-      - name: Connexion au registre
-        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: tofu plan
+        run: tofu plan -no-color -lock-timeout=120s -out=tfplan
 
-      - name: Déployer
+      # On applique LE plan affiché au-dessus, pas un nouveau calcul.
+      - name: tofu apply
         run: |
-          cd "$STAGING_DIR"
-          COMPOSE_FILE=compose.staging.yaml ./deploy.sh "$TAG"
+          tofu apply -no-color -lock-timeout=120s tfplan
+          rm -f tfplan   # contient les valeurs sensibles en clair
 
-      # Le runner est un conteneur : localhost serait lui-même.
       - name: Smoke test
-        run: |
-          cd "$STAGING_DIR"
-          ./smoke-test.sh "http://host.docker.internal:${FRONT_PORT}/health" "$TAG"
+        working-directory: .
+        run: ./deploy/smoke-test.sh "http://host.docker.internal:${FRONT_PORT}/health" "$TAG"
 
-      - name: Déconnexion du registre
-        if: ${{ always() }}
-        run: docker logout ghcr.io
+      - name: Résumé
+        if: always()
+        run: |
+          {
+            echo "### Staging (OpenTofu)"
+            echo "| Version | URL |"
+            echo "|---|---|"
+            echo "| \`$TAG\` | $(tofu output -raw url 2>/dev/null || echo '?') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -f tfplan
 
   # --------------------------------------------------------------------------
   # deploy-production : après staging vert ET approbation humaine.

@@ -1,0 +1,5 @@
+# Copier en terraform.tfvars (ignoré par Git) pour ne pas retaper les -var :
+#   cp terraform.tfvars.example terraform.tfvars
+ghcr_owner = "votre-compte-en-minuscules"
+image_tag  = "latest"
+front_port = 8081
