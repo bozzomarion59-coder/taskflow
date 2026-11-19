@@ -1,0 +1,181 @@
+# ============================================================================
+# iac.yml : l'infrastructure (infra/) passe en revue comme du code (Jour 4)
+#
+#   PR qui touche infra/ ──► iac-validate (ubuntu-latest) : fmt -check, validate
+#                         └► iac-plan (runner du lab)     : plan contre le VRAI
+#                            state du staging, publié dans le résumé du job et en
+#                            commentaire de la PR
+#   chaque semaine (schedule) ─► iac-plan en mode « détection de dérive » : le job
+#                            échoue si le staging ne correspond plus au code
+#
+# Pourquoi le plan tourne-t-il sur le runner self-hosted et pas sur ubuntu-latest ?
+#   ubuntu-latest a bien un daemon Docker, mais VIDE et sans notre state : son plan
+#   dirait « 9 to add » à chaque PR, ce qui n'apprend rien au relecteur. Le runner
+#   du lab voit le staging réel et son state ($STAGING_DIR) : le plan montre la
+#   différence exacte que l'apply produira.
+#   Le compromis : du code de PR s'exécute sur une machine qui a le socket Docker
+#   (= root sur le poste). On ne le fait donc QUE pour les PR du dépôt lui-même
+#   (jamais pour une PR venant d'un fork), et le job ne reçoit aucun secret.
+#
+# L'apply n'est PAS ici : il est fait par release.yml (job deploy-staging), après
+# merge sur main, avec la version qui vient d'être construite.
+# ============================================================================
+
+name: IaC
+
+on:
+  pull_request:
+    paths:
+      - "infra/**"
+      - ".github/workflows/iac.yml"
+  # Détection de dérive : quelqu'un a-t-il modifié le staging à la main ?
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: iac-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  TOFU_VERSION: "1.13.5"
+  TF_IN_AUTOMATION: "1" # messages adaptés à un pipeline (pas de « run tofu apply now »)
+  TF_INPUT: "0" # jamais de question interactive : une variable manquante = erreur
+
+jobs:
+  # ---------- Contrôles statiques : aucun daemon, aucun state ----------------
+  validate:
+    name: iac-validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      # Formatage canonique : -diff montre la correction attendue dans le log.
+      - name: tofu fmt -check
+        run: tofu fmt -check -recursive -diff
+
+      # -backend=false : pas de state ici ; -lockfile=readonly : échoue si
+      # .terraform.lock.hcl n'est pas à jour (il doit être commité).
+      - name: tofu init
+        run: tofu init -backend=false -lockfile=readonly
+
+      - name: tofu validate
+        run: tofu validate
+
+  # ---------- Plan contre le staging réel ------------------------------------
+  plan:
+    name: iac-plan
+    needs: validate
+    # Jamais pour une PR venant d'un fork (voir l'en-tête).
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, lab]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write # pour publier le plan en commentaire
+    defaults:
+      run:
+        working-directory: infra
+    env:
+      # Les providers téléchargés sont gardés entre deux runs (runner persistant).
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/../.tofu-plugin-cache
+    steps:
+      - name: Vérifier le runner
+        working-directory: .
+        run: |
+          if [ -z "${STAGING_DIR:-}" ] || [ ! -d "$STAGING_DIR" ]; then
+            echo "::error::STAGING_DIR absent : le runner du lab est-il bien configuré ?"; exit 1
+          fi
+          mkdir -p "$TF_PLUGIN_CACHE_DIR"
+          tofu version
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: tofu init (state dans STAGING_DIR)
+        run: tofu init -lockfile=readonly -backend-config="path=$STAGING_DIR/terraform.tfstate"
+
+      # Le plan garde la version DÉJÀ déployée : on ne veut voir que l'effet
+      # du changement d'infrastructure proposé par la PR.
+      - name: Variables OpenTofu
+        run: ./ci-env.sh
+
+      # -detailed-exitcode : 0 = rien à faire, 2 = changements, 1 = erreur.
+      # -lock-timeout : attend si un déploiement tient le verrou du state.
+      - name: tofu plan
+        id: plan
+        run: |
+          set +e
+          tofu plan -no-color -lock-timeout=120s -detailed-exitcode -out=tfplan > plan.log 2>&1
+          code=$?
+          set -e
+          cat plan.log
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = 1 ]; then echo "::error::tofu plan a échoué"; exit 1; fi
+          tofu show -no-color tfplan > plan.txt
+          # Le fichier tfplan contient les valeurs sensibles EN CLAIR : on le supprime.
+          rm -f tfplan
+
+      - name: Publier le plan dans le résumé
+        env:
+          EXITCODE: ${{ steps.plan.outputs.exitcode }}
+        run: |
+          summary="$(grep -E '^(Plan:|No changes\.)' plan.log | tail -n 1 || true)"
+          {
+            echo "### Plan OpenTofu : staging"
+            echo
+            echo "**${summary:-voir le log}** (version des images : \`$TF_VAR_image_tag\`)"
+            echo
+            echo "<details><summary>Plan complet</summary>"
+            echo
+            echo '```'
+            head -c 60000 plan.txt
+            echo '```'
+            echo "</details>"
+          } | tee plan.md >> "$GITHUB_STEP_SUMMARY"
+          if [ "$EXITCODE" = 2 ] && [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "::error::Dérive détectée : le staging ne correspond plus au code de main"
+            exit 1
+          fi
+
+      # Un seul commentaire par PR, mis à jour à chaque push (repéré par un marqueur).
+      - name: Commenter la PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- iac-plan -->';
+            const body = `${marker}\n${fs.readFileSync('infra/plan.md', 'utf8')}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number,
+            });
+            const previous = comments.find((c) => c.body.startsWith(marker));
+            if (previous) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: previous.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Nettoyer
+        if: always()
+        run: rm -f tfplan plan.txt plan.log plan.md
