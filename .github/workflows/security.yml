@@ -1,0 +1,187 @@
+# ============================================================================
+# security.yml : DevSecOps (Jour 5) = la sécurité vérifiée à chaque changement
+#
+#   secrets      gitleaks sur TOUT l'historique Git          (code / commit)
+#   dependances  npm audit --audit-level=high, api + front    (SCA)
+#   sast         Semgrep, règles publiques sans compte         (analyse statique)
+#   dast         OWASP ZAP baseline contre la stack Compose    (analyse dynamique)
+#                lancée dans le job (front sur http://localhost:8080)
+#
+# Complète le Jour 3 : gitleaks en pre-commit, Trivy dans release.yml, Dependabot.
+# Pourquoi aussi en "schedule" ? Une dépendance saine lundi peut avoir une CVE
+# publiée mercredi sans que personne ne touche au code : on rescanne chaque semaine.
+# Les rapports sont publiés en artefacts (onglet Actions > run > Artifacts).
+# ============================================================================
+
+name: Sécurité
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1"   # chaque lundi à 5h17 UTC (minute "bizarre" = moins de file d'attente)
+  workflow_dispatch:         # bouton "Run workflow"
+
+# Moindre privilège : lecture seule. Aucun job n'écrit dans le dépôt, ne commente
+# la PR ni ne publie de résultat dans l'onglet Security (cf. bonus CodeQL / SARIF).
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------- 1. Secrets : gitleaks sur l'historique complet -----------------
+  secrets:
+    name: Secrets (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      # Actions épinglées par SHA (immuable) ; le commentaire donne la version
+      # lisible et Dependabot (github-actions) les met à jour.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0     # TOUT l'historique : un secret supprimé reste dans les anciens commits
+
+      # Binaire officiel + vérification de la somme SHA-256 (supply chain).
+      # L'action gitleaks/gitleaks-action exige une licence pour les comptes d'organisation.
+      - name: Installer gitleaks ${{ env.GITLEAKS_VERSION }}
+        run: |
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfLO "$base/$archive"
+          curl -sSfLO "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          sha256sum --ignore-missing -c "gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          tar -xzf "$archive" gitleaks
+
+      # .gitleaks.toml (à la racine) est lu automatiquement : règles par défaut
+      # + liste d'exceptions documentées dans docs/SECURITE.md.
+      - name: Scanner l'historique
+        run: ./gitleaks git --redact --verbose --report-format sarif --report-path gitleaks.sarif .
+
+      - name: Rapport gitleaks
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rapport-gitleaks
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+  # ---------- 2. Dépendances : npm audit (SCA) --------------------------------
+  dependances:
+    name: Dépendances (npm audit) ${{ matrix.dossier }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false       # un échec côté api ne masque pas le résultat du front
+      matrix:
+        dossier: [api, front]
+    defaults:
+      run:
+        working-directory: ${{ matrix.dossier }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # npm audit lit package-lock.json : pas besoin de `npm ci`.
+      # Rapport JSON complet (toutes sévérités) pour le triage, sans faire échouer le step...
+      - name: Rapport complet (JSON)
+        run: npm audit --json > npm-audit.json || true
+
+      # ...puis le contrôle bloquant : échec s'il existe une vulnérabilité high ou critical.
+      # Les devDependencies sont incluses : elles s'exécutent dans le CI et au build
+      # (le front n'a QUE des devDependencies). Compromis discuté dans SECURITE.md.
+      - name: Bloquer sur high / critical
+        run: npm audit --audit-level=high
+
+      - name: Rapport npm audit
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rapport-npm-audit-${{ matrix.dossier }}
+          path: ${{ matrix.dossier }}/npm-audit.json
+
+  # ---------- 3. SAST : Semgrep ------------------------------------------------
+  sast:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Le job tourne DANS l'image officielle : rien à installer.
+    container:
+      image: semgrep/semgrep:1.184.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Règles publiques du registre Semgrep, sans compte ni jeton :
+      #   p/javascript (règles JS/Express), p/nodejsscan (njsscan : XSS, SQLi, exec, eval...).
+      # --error : code de sortie 1 s'il y a au moins un résultat => job rouge.
+      # Un faux positif se neutralise au cas par cas avec un commentaire
+      # `// nosemgrep: <id-de-la-règle>` justifié dans SECURITE.md.
+      - name: Analyse statique
+        run: >-
+          semgrep scan
+          --config p/javascript
+          --config p/nodejsscan
+          --metrics=off
+          --error
+          --sarif-output=semgrep.sarif
+
+      - name: Rapport Semgrep
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rapport-semgrep
+          path: semgrep.sarif
+          if-no-files-found: ignore
+
+  # ---------- 4. DAST : OWASP ZAP baseline sur l'application qui tourne -------
+  dast:
+    name: DAST (ZAP baseline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # La même stack qu'en dev (compose.yaml fourni) : db + api + front sur :8080.
+      # --wait : rend la main quand tous les services sont "healthy".
+      - name: Démarrer TaskFlow
+        run: docker compose up -d --build --wait --wait-timeout 180
+
+      - name: Vérifier que l'application répond
+        run: curl -fsS http://localhost:8080/health
+
+      # Scan "baseline" = PASSIF : ZAP explore le site (spider ~1 min) et analyse les
+      # réponses (en-têtes, cookies, fuites d'info) SANS envoyer d'attaque.
+      # .zap/rules.tsv : règle par règle, FAIL (bloque), WARN (signale), IGNORE (faux positif triagé).
+      # -I : les WARN ne font pas échouer le job, seuls les FAIL le font.
+      # --network host : le conteneur ZAP joint localhost:8080 de la machine du job.
+      - name: Scan ZAP baseline
+        run: |
+          mkdir -p zap
+          cp .zap/rules.tsv zap/
+          chmod -R a+rwx zap        # ZAP tourne en utilisateur "zap" (uid 1000) dans son conteneur
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:2.17.0 \
+            zap-baseline.py -t http://localhost:8080 \
+              -c rules.tsv -I \
+              -r zap-rapport.html -J zap-rapport.json -w zap-rapport.md
+          cat zap/zap-rapport.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Logs de la stack (en cas d'échec)
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Rapport ZAP
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rapport-zap
+          path: zap/zap-rapport.*
+          if-no-files-found: ignore
+
+      - name: Arrêter la stack
+        if: always()
+        run: docker compose down -v

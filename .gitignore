@@ -38,3 +38,4 @@ backups/
 *.tfplan
 tfplan
 terraform.tfvars
+zap-local/
