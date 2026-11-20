@@ -1,0 +1,15 @@
+# .zap/rules.tsv : décision de l'équipe pour chaque règle ZAP (séparateur = TABULATION).
+# Format : ID<TAB>ACTION<TAB>justification. ACTION = IGNORE | INFO | WARN | FAIL.
+# Règle absente = WARN (valeur par défaut de zap-baseline.py ; -I => n'échoue pas le job).
+# Chaque IGNORE est justifié dans docs/SECURITE.md (section « Exceptions »).
+10038	FAIL	CSP absente : corrigé dans front/nginx.conf, toute régression bloque
+10055	WARN	CSP présente mais faible (wildcard, unsafe-inline...) : à examiner
+10020	FAIL	Anti-clickjacking (X-Frame-Options / frame-ancestors) : corrigé, régression bloquante
+10021	FAIL	X-Content-Type-Options absent : corrigé, régression bloquante
+10063	FAIL	Permissions-Policy absent : corrigé, régression bloquante
+10036	FAIL	Version de Nginx dans l'en-tête Server : server_tokens off, régression bloquante
+10037	FAIL	X-Powered-By (Express) : masqué par proxy_hide_header, régression bloquante
+90004	WARN	Isolation Spectre (COOP/COEP/CORP) : en-têtes posés, surveillé sans bloquer
+10049	IGNORE	Storable and Cacheable Content : informatif, les assets Vite sont volontairement cachés 1 an (nom avec hash)
+10109	IGNORE	Modern Web Application : informatif, signale juste une SPA (conseille l'Ajax spider)
+10027	IGNORE	Information Disclosure - Suspicious Comments : mots TODO/user/select dans le bundle Vite minifié, vérifié = faux positif
